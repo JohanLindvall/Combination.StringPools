@@ -13,6 +13,20 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
         PoolIndexBits =
             24; // Number of bits to use for pool index in handle (more bits = more pools, but less strings per pool)
 
+    // Number of bits available for the pool-relative offset in a handle.
+    private const int OffsetBits = 64 - PoolIndexBits;
+
+    // Mask for the pool-relative offset part of a handle.
+    private const ulong OffsetMask = (1UL << OffsetBits) - 1;
+
+    // A deduplication table entry packs an occupancy flag, a hash tag and the pool-relative offset.
+    // Since every entry in a pool's table shares the same pool index, those high handle bits would be
+    // wasted; instead we store hash tag bits there so probe collisions can be rejected without touching
+    // the string data. Layout: bit 63 = occupied, bits 40..62 = hash tag, bits 0..39 = offset.
+    private const int TagBits = PoolIndexBits - 1;
+    private const ulong OccupiedBit = 1UL << 63;
+    private const ulong TagMask = (1UL << TagBits) - 1;
+
     // Maximum fill factor for deduplication table. Performance degrades when it is close to 1.
     private const float MaxDeduplicationTableFillFactor = 0.9f;
 
@@ -84,18 +98,20 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
 
     PooledUtf8String IUtf8StringPool.Add(ReadOnlySpan<char> value)
     {
-        var utf8ByteCount = Encoding.UTF8.GetByteCount(value);
-        if (utf8ByteCount < 16384)
+        // Encode in a single pass: GetMaxByteCount is cheap arithmetic, avoiding the full
+        // scan that GetByteCount would do before the actual GetBytes pass.
+        var maxByteCount = Encoding.UTF8.GetMaxByteCount(value.Length);
+        if (maxByteCount <= 16384)
         {
             // Use the stack for small strings
-            Span<byte> utf8 = stackalloc byte[utf8ByteCount];
-            Encoding.UTF8.GetBytes(value, utf8);
-            return AddInternal(utf8);
+            Span<byte> utf8 = stackalloc byte[maxByteCount];
+            var utf8ByteCount = Encoding.UTF8.GetBytes(value, utf8);
+            return AddInternal(utf8[..utf8ByteCount]);
         }
 
-        var buffer = new byte[utf8ByteCount];
-        Encoding.UTF8.GetBytes(value, buffer);
-        return AddInternal(buffer);
+        var buffer = new byte[maxByteCount];
+        var bufferByteCount = Encoding.UTF8.GetBytes(value, buffer);
+        return AddInternal(buffer.AsSpan(0, bufferByteCount));
     }
 
     PooledUtf8String IUtf8StringPool.Add(ReadOnlySpan<byte> value)
@@ -120,7 +136,7 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
             throw new ArgumentOutOfRangeException(nameof(value), "String is too long to be pooled");
         }
 
-        var stringHash = 0;
+        ulong stringHash = 0;
         var didAlloc = false;
         var oldSize = Interlocked.Read(ref usedBytes);
 
@@ -129,7 +145,7 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
 
         if (deduplicationTable is not null)
         {
-            stringHash = unchecked((int)StringHash.Compute(value));
+            stringHash = StringHash.Compute(value);
             if (TryDeduplicate(stringHash, value, out var result))
             {
                 return new PooledUtf8String(result);
@@ -224,18 +240,20 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
 
     PooledUtf8String? IUtf8DeduplicatedStringPool.TryGet(ReadOnlySpan<char> value)
     {
-        var utf8ByteCount = Encoding.UTF8.GetByteCount(value);
-        if (utf8ByteCount < 16384)
+        // Encode in a single pass: GetMaxByteCount is cheap arithmetic, avoiding the full
+        // scan that GetByteCount would do before the actual GetBytes pass.
+        var maxByteCount = Encoding.UTF8.GetMaxByteCount(value.Length);
+        if (maxByteCount <= 16384)
         {
             // Use the stack for small strings
-            Span<byte> utf8 = stackalloc byte[utf8ByteCount];
-            Encoding.UTF8.GetBytes(value, utf8);
-            return TryGetInternal(utf8);
+            Span<byte> utf8 = stackalloc byte[maxByteCount];
+            var utf8ByteCount = Encoding.UTF8.GetBytes(value, utf8);
+            return TryGetInternal(utf8[..utf8ByteCount]);
         }
 
-        var buffer = new byte[utf8ByteCount];
-        Encoding.UTF8.GetBytes(value, buffer);
-        return TryGetInternal(buffer);
+        var buffer = new byte[maxByteCount];
+        var bufferByteCount = Encoding.UTF8.GetBytes(value, buffer);
+        return TryGetInternal(buffer.AsSpan(0, bufferByteCount));
     }
 
     PooledUtf8String? IUtf8DeduplicatedStringPool.TryGet(ReadOnlySpan<byte> value)
@@ -254,7 +272,7 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
             throw new InvalidOperationException("Deduplication is not enabled for this pool");
         }
 
-        if (!TryDeduplicate(unchecked((int)StringHash.Compute(value)), value, out var result))
+        if (!TryDeduplicate(StringHash.Compute(value), value, out var result))
         {
             return null;
         }
@@ -262,43 +280,50 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
         return new PooledUtf8String(result);
     }
 
-    private bool TryDeduplicate(int stringHash, ReadOnlySpan<byte> value, out ulong offset)
+    private bool TryDeduplicate(ulong stringHash, ReadOnlySpan<byte> value, out ulong offset)
     {
         using (disposeLock.PreventDispose())
         {
-            if (deduplicationTable == null)
+            var table = deduplicationTable;
+            if (table == null)
             {
                 offset = ulong.MaxValue;
                 return false;
             }
 
-            var tableSize = 1 << deduplicationTableBits;
-            var tableIndex = stringHash & (tableSize - 1);
-            for (var i = 0; i < tableSize; i++)
+            var tableMask = (1 << deduplicationTableBits) - 1;
+            var tableIndex = (int)stringHash & tableMask;
+            var tag = (stringHash >> (64 - TagBits)) << OffsetBits;
+            for (var i = 0; i <= tableMask; i++)
             {
-                var tableEntry = deduplicationTable[(tableIndex + i) % tableSize];
+                var tableEntry = table[(tableIndex + i) & tableMask];
                 if (tableEntry == 0)
                 {
                     offset = ulong.MaxValue;
                     return false;
                 }
 
-                var handle = tableEntry - 1;
+                // Reject without touching the string data unless the stored hash tag matches.
+                if ((tableEntry & (TagMask << OffsetBits)) != tag)
+                {
+                    continue;
+                }
 
-                var poolOffset = handle & ((1UL << (64 - PoolIndexBits)) - 1);
+                var poolOffset = tableEntry & OffsetMask;
                 var poolBytes = GetStringBytes(poolOffset);
                 if (poolBytes.Length == value.Length && value.SequenceEqual(poolBytes))
                 {
-                    offset = handle;
+                    offset = ((ulong)index << OffsetBits) | poolOffset;
                     return true;
                 }
             }
+
             offset = ulong.MaxValue;
             return false;
         }
     }
 
-    private void AddToDeduplicationTable(ulong[]? currentTable, int currentTableBits, int stringHash, ulong handle)
+    private void AddToDeduplicationTable(ulong[]? currentTable, int currentTableBits, ulong stringHash, ulong handle)
     {
         if (currentTable == null)
         {
@@ -306,14 +331,16 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
         }
 
         var tableSize = 1 << currentTableBits;
-        var tableIndex = stringHash & (tableSize - 1);
+        var tableMask = tableSize - 1;
+        var tableIndex = (int)stringHash & tableMask;
+        var entry = OccupiedBit | ((stringHash >> (64 - TagBits)) << OffsetBits) | (handle & OffsetMask);
         for (var i = 0; i < tableSize; i++)
         {
-            var tableEntry = currentTable[(tableIndex + i) % tableSize];
-            if (tableEntry == 0)
+            var slot = (tableIndex + i) & tableMask;
+            if (currentTable[slot] == 0)
             {
                 ++deduplicationFillCount;
-                currentTable[(tableIndex + i) % tableSize] = handle + 1;
+                currentTable[slot] = entry;
                 if (deduplicationFillCount > tableSize * MaxDeduplicationTableFillFactor)
                 {
                     ResizeDeduplicationTable(currentTableBits + 1);
@@ -338,10 +365,9 @@ internal sealed class Utf8StringPool : IUtf8DeduplicatedStringPool
             var tableEntry = deduplicationTable[i];
             if (tableEntry != 0)
             {
-                var handle = tableEntry - 1;
-                var poolOffset = handle & ((1UL << (64 - PoolIndexBits)) - 1);
+                var poolOffset = tableEntry & OffsetMask;
                 var poolBytes = GetStringBytes(poolOffset);
-                AddToDeduplicationTable(newDeduplicationTable, newBits, (int)StringHash.Compute(poolBytes), handle);
+                AddToDeduplicationTable(newDeduplicationTable, newBits, StringHash.Compute(poolBytes), poolOffset);
             }
         }
         deduplicationTable = newDeduplicationTable;
